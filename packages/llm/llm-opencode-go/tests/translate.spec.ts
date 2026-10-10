@@ -1,0 +1,261 @@
+import { describe, expect, it } from 'vitest'
+import {
+  mapAnthropicStopReason,
+  mapFinishReason,
+  mapResponsesUsage,
+  translate,
+  translateAnthropic,
+  translateResponses,
+} from '../src/translate.ts'
+
+/** Serialize an event object the way the gateway frames it on the wire. */
+const json = (value: unknown): string => JSON.stringify(value)
+
+async function* feed(...payloads: string[]): AsyncGenerator<string> {
+  for (const payload of payloads) yield payload
+}
+
+async function collect(payloads: string[]): Promise<unknown[]> {
+  const chunks: unknown[] = []
+  for await (const chunk of translate(feed(...payloads))) chunks.push(chunk)
+  return chunks
+}
+
+/** Drive one protocol translator over payloads and collect its chunks. */
+async function collectWith<T>(
+  translator: (payloads: AsyncIterable<string>) => AsyncGenerator<T>,
+  payloads: string[],
+): Promise<T[]> {
+  const chunks: T[] = []
+  for await (const chunk of translator(feed(...payloads))) chunks.push(chunk)
+  return chunks
+}
+
+describe('translate tool-call identity', () => {
+  it('keeps the first-frame id/name when later argument fragments echo empty placeholders', async () => {
+    // Some gateways (observed: OpenCode Go) send id/name on the first
+    // tool_calls frame and then null/empty placeholders on argument
+    // fragments, instead of omitting the fields as the streaming spec does.
+    const chunks = await collect([
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":""}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":null,"function":{"name":null,"arguments":"{\\"path\\":"}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"","arguments":"\\"a.txt\\"}"}}]},"finish_reason":"tool_calls"}]}',
+      '[DONE]',
+    ])
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 0, id: 'c1', name: 'read_file', argumentsDelta: '' },
+      { type: 'tool-call-delta', index: 0, id: 'c1', name: 'read_file', argumentsDelta: '{"path":' },
+      { type: 'tool-call-delta', index: 0, id: 'c1', name: 'read_file', argumentsDelta: '"a.txt"}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'c1', name: 'read_file', arguments: '{"path":"a.txt"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ])
+  })
+})
+
+describe('translate', () => {
+  it('assembles a text generation with usage and a stop finish', async () => {
+    const chunks = await collect([
+      '{"choices":[{"delta":{"role":"assistant","content":null}}]}',
+      '{"choices":[{"delta":{"content":"hello"}}]}',
+      '{"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}',
+      '[DONE]',
+    ])
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: 'hello' },
+      { type: 'text-delta', index: 0, text: ' world' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: 'hello world' } },
+      { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ])
+  })
+
+  it('opens reasoning and tool-call blocks from their deltas', async () => {
+    const chunks = await collect([
+      '{"choices":[{"delta":{"reasoning_content":"think"}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\\"path\\":"}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"a.txt\\"}"}}]},"finish_reason":"tool_calls"}]}',
+      '[DONE]',
+    ])
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'reasoning' },
+      { type: 'reasoning-delta', index: 0, text: 'think' },
+      { type: 'block-start', index: 1, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 1, id: 'c1', name: 'read_file', argumentsDelta: '{"path":' },
+      { type: 'tool-call-delta', index: 1, id: 'c1', name: 'read_file', argumentsDelta: '"a.txt"}' },
+      { type: 'block-end', index: 0, block: { type: 'reasoning', text: 'think' } },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'c1', name: 'read_file', arguments: '{"path":"a.txt"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ])
+  })
+
+  it('subtracts cached tokens from the input count', async () => {
+    const chunks = await collect([
+      '{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":7}}}',
+      '[DONE]',
+    ])
+    expect(chunks.at(-2)).toEqual({
+      type: 'usage',
+      usage: { inputTokens: 3, outputTokens: 1, cacheReadTokens: 7 },
+    })
+  })
+
+  it('treats a wire usage of null as absent instead of crashing', async () => {
+    const chunks = await collect([
+      '{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":null}',
+      '[DONE]',
+    ])
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: 'ok' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: 'ok' } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ])
+  })
+
+  it('maps an empty completion to an EMPTY_RESPONSE error finish', async () => {
+    const chunks = await collect(['{"choices":[{"delta":{},"finish_reason":"stop"}]}', '[DONE]'])
+    expect(chunks.at(-1)).toMatchObject({
+      type: 'finish',
+      reason: { kind: 'error', failure: { code: 'EMPTY_RESPONSE' } },
+    })
+  })
+
+  it('rejects malformed payloads and missing [DONE]', async () => {
+    await expect(collect(['not json'])).rejects.toThrow(/malformed SSE payload/)
+    await expect(collect(['{"choices":[{"delta":{"content":"x"}}]}'])).rejects.toThrow('SSE payload stream ended without [DONE]')
+  })
+})
+
+describe('mapFinishReason', () => {
+  it('maps the standard vocabulary', () => {
+    expect(mapFinishReason('stop')).toEqual({ kind: 'stop' })
+    expect(mapFinishReason('tool_calls')).toEqual({ kind: 'tool-calls' })
+    expect(mapFinishReason('length')).toEqual({ kind: 'max-tokens' })
+    expect(mapFinishReason('content_filter')).toEqual({
+      kind: 'error',
+      failure: { message: 'model stopped: content_filter', code: 'CONTENT_FILTER' },
+    })
+  })
+})
+
+describe('translateAnthropic', () => {
+  it('assembles text, cache-aware usage, and a stop finish', async () => {
+    const chunks = await collectWith(translateAnthropic, [
+      json({ type: 'message_start', message: { usage: { input_tokens: 15, output_tokens: 0, cache_read_input_tokens: 5 } } }),
+      json({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+      json({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello' } }),
+      json({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '!' } }),
+      json({ type: 'content_block_stop', index: 0 }),
+      json({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } }),
+      json({ type: 'message_stop' }),
+    ])
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: 'Hello' },
+      { type: 'text-delta', index: 0, text: '!' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: 'Hello!' } },
+      { type: 'usage', usage: { inputTokens: 15, outputTokens: 2, cacheReadTokens: 5 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ])
+  })
+
+  it('assembles a tool_use block from input_json_delta fragments', async () => {
+    const chunks = await collectWith(translateAnthropic, [
+      json({ type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 0 } } }),
+      json({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: {} } }),
+      json({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"city":' } }),
+      json({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '"Paris"}' } }),
+      json({ type: 'content_block_stop', index: 0 }),
+      json({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 10 } }),
+      json({ type: 'message_stop' }),
+    ])
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 0, id: 'toolu_1', name: 'get_weather', argumentsDelta: '{"city":' },
+      { type: 'tool-call-delta', index: 0, id: 'toolu_1', name: 'get_weather', argumentsDelta: '"Paris"}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'toolu_1', name: 'get_weather', arguments: '{"city":"Paris"}' } },
+      { type: 'usage', usage: { inputTokens: 5, outputTokens: 10 } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ])
+  })
+
+  it('rejects a stream that ends without message_stop', async () => {
+    await expect(collectWith(translateAnthropic, [json({ type: 'message_start', message: { usage: { input_tokens: 1 } } })])).rejects.toThrow('SSE payload stream ended without message_stop')
+  })
+})
+
+describe('translateResponses', () => {
+  it('assembles output text, subtracts cached input, and stops', async () => {
+    const chunks = await collectWith(translateResponses, [
+      json({ type: 'response.created' }),
+      json({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'm1' } }),
+      json({ type: 'response.output_text.delta', output_index: 0, delta: 'Hi' }),
+      json({ type: 'response.output_text.delta', output_index: 0, delta: ' there' }),
+      json({ type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: 'm1', status: 'completed' } }),
+      json({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 10, output_tokens: 2, input_tokens_details: { cached_tokens: 4 } } } }),
+    ])
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: 'Hi' },
+      { type: 'text-delta', index: 0, text: ' there' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: 'Hi there' } },
+      { type: 'usage', usage: { inputTokens: 6, outputTokens: 2, cacheReadTokens: 4 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ])
+  })
+
+  it('assembles a function_call from item and argument events', async () => {
+    const chunks = await collectWith(translateResponses, [
+      json({ type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } }),
+      json({ type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"city":"Paris"}' }),
+      json({ type: 'response.function_call_arguments.done', output_index: 0, arguments: '{"city":"Paris"}', name: 'get_weather' }),
+      json({ type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Paris"}' } }),
+      json({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 3, output_tokens: 1 } } }),
+    ])
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'get_weather', argumentsDelta: '{"city":"Paris"}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_1', name: 'get_weather', arguments: '{"city":"Paris"}' } },
+      { type: 'usage', usage: { inputTokens: 3, outputTokens: 1 } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ])
+  })
+
+  it('maps a max_output_tokens incomplete response to a max-tokens finish', async () => {
+    const chunks = await collectWith(translateResponses, [
+      json({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'm1' } }),
+      json({ type: 'response.output_text.delta', output_index: 0, delta: 'partial' }),
+      json({ type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, usage: { input_tokens: 2, output_tokens: 1 } } }),
+    ])
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+  })
+
+  it('rejects a stream that ends without a terminal response event', async () => {
+    await expect(collectWith(translateResponses, [json({ type: 'response.created' })])).rejects.toThrow('SSE payload stream ended without response.completed')
+  })
+})
+
+describe('usage and stop mapping', () => {
+  it('maps the Anthropic stop vocabulary', () => {
+    expect(mapAnthropicStopReason('end_turn')).toEqual({ kind: 'stop' })
+    expect(mapAnthropicStopReason('stop_sequence')).toEqual({ kind: 'stop' })
+    expect(mapAnthropicStopReason(null)).toEqual({ kind: 'stop' })
+    expect(mapAnthropicStopReason('tool_use')).toEqual({ kind: 'tool-calls' })
+    expect(mapAnthropicStopReason('max_tokens')).toEqual({ kind: 'max-tokens' })
+    expect(mapAnthropicStopReason('refusal')).toEqual({
+      kind: 'error',
+      failure: { message: 'model stopped: refusal', code: 'REFUSAL' },
+    })
+  })
+
+  it('subtracts cached tokens from Responses input', () => {
+    expect(mapResponsesUsage({
+      input_tokens: 100,
+      output_tokens: 7,
+      input_tokens_details: { cached_tokens: 40 },
+      output_tokens_details: { reasoning_tokens: 3 },
+    })).toEqual({ inputTokens: 60, outputTokens: 7, cacheReadTokens: 40, reasoningTokens: 3 })
+  })
+})

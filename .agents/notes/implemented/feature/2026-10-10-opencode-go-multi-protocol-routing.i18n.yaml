@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-10-10-opencode-go-multi-protocol-routing.md
+2026-10-10-opencode-go-multi-protocol-routing.md: 39e139faf58e9a78e568c2b6092293f855b4f254
+2026-10-10-opencode-go-multi-protocol-routing.zh.md: 46b74beb9171199029359f32c6763cf30bc837ab
